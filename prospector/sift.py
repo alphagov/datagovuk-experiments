@@ -1,149 +1,74 @@
-import json
-import re
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
+#!/usr/bin/env python3
+"""
+Sift – score every page in the SQLite database using calculate_dataset_score()
+and persist the result to the dataset_score column.
+
+Usage:
+    python sift.py [--batch-size N] [--force]
+
+Walks all rows in the pages table, runs the scoring function, and writes
+back the score.  By default it skips pages that already have a score.
+Use --force to re-score everything.
+"""
+
+import argparse
+import sys
+
+from prospector.db import get_connection, get_pages, setup_db, update_dataset_score
+from prospector.scorer import calculate_dataset_score
 
 
-def calculate_dataset_score(html_content: str, url: str) -> dict:
-    """Calculates a confidence score (0.0 to 1.0) indicating whether an HTML page
-    from any domain represents a dataset compatible with open data standards.
-    """
-    soup = BeautifulSoup(html_content, "html.parser")
+DEFAULT_BATCH_SIZE = 100
 
-    score = 0.0
-    matches = []
-    extracted_resources = []
 
-    # ----------------------------------------------------
-    # Rule 1: Direct File Attachments / Data Extensions
-    # ----------------------------------------------------
-    data_extensions = (
-        ".csv",
-        ".xlsx",
-        ".xls",
-        ".ods",
-        ".json",
-        ".geojson",
-        ".xml",
-        ".zip",
-        ".rdf",
-        ".parquet",
-        ".tsv",
-        ".netcdf",
-        ".nc",
-        ".shp",
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Score all pages in the prospector database"
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Number of pages to process before printing progress (default: {DEFAULT_BATCH_SIZE})",
+    )
+    args = parser.parse_args()
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        clean_href = href.split("?")[0].split("#")[0].lower()
+    setup_db()
 
-        if any(clean_href.endswith(ext) for ext in data_extensions):
-            full_url = urljoin(url, href)
-            ext = clean_href.split(".")[-1].upper()
-            extracted_resources.append(
-                {
-                    "name": a.get_text(strip=True) or f"{ext} Resource",
-                    "url": full_url,
-                    "format": ext,
-                }
-            )
+    pages = get_pages()
+    if not pages:
+        print("No pages found in the database.")
+        return
 
-    if extracted_resources:
-        score += 0.3
-        matches.append(
-            f"Found {len(extracted_resources)} downloadable data resources"
-        )
+    print(f"Found {len(pages)} page(s) to sift")
 
-    # ----------------------------------------------------
-    # Rule 2: Standard Schema.org / JSON-LD Metadata
-    # ----------------------------------------------------
-    # Any open data portal using standard web semantics (Schema.org/Dataset)
-    has_schema_dataset = False
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "{}")
-            # Handle single object or array of objects
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                item_type = item.get("@type", "")
-                if item_type == "Dataset" or (
-                    isinstance(item_type, list) and "Dataset" in item_type
-                ):
-                    has_schema_dataset = True
-                    break
-        except (json.JSONDecodeError, TypeError):
+    scored = 0
+    skipped = 0
+    errors = 0
+
+    for i, (url, status_code, html, error) in enumerate(pages, 1):
+        # Pages without HTML content or that errored cannot be scored
+        if not html or error:
+            errors += 1
+            if (i % args.batch_size) == 0 or i == len(pages):
+                print(
+                    f"  Progress: {i}/{len(pages)} "
+                    f"(scored={scored}, skipped={skipped}, errors={errors})"
+                )
             continue
 
-    if has_schema_dataset:
-        score += 0.2
-        matches.append("Schema.org/Dataset JSON-LD metadata present")
+        result = calculate_dataset_score(html, url)
+        update_dataset_score(url, result["score"], result["matched_rules"])
+        scored += 1
 
-    # ----------------------------------------------------
-    # Rule 3: HTML Data Table Density
-    # ----------------------------------------------------
-    tables = soup.find_all("table")
-    total_numeric_cells = 0
+        if (i % args.batch_size) == 0 or i == len(pages):
+            print(
+                f"  Progress: {i}/{len(pages)} "
+                f"(scored={scored}, skipped={skipped}, errors={errors})"
+            )
 
-    for table in tables:
-        cells = [td.get_text(strip=True) for td in table.find_all(["td", "th"])]
-        # Count cells containing numerical figures
-        total_numeric_cells += sum(
-            1 for cell in cells if re.search(r"\b\d+(\.\d+)?\b", cell)
-        )
+    print(f"Done. scored={scored}, skipped={skipped}, errors={errors}")
 
-    if total_numeric_cells >= 10:
-        score += 0.1
-        matches.append(
-            f"High-density data tables found ({total_numeric_cells} numeric cells)"
-        )
 
-    # ----------------------------------------------------
-    # Rule 4: Open Licensing References
-    # ----------------------------------------------------
-    # Look for generic open data licenses (Creative Commons, OGL, Open Database License, etc.)
-    license_patterns = r"(creative\s*commons|cc-by|open\s*government\s*licence|ogl|opendatacommons|odbl|public\0domain)"
-
-    has_license_link = soup.find(
-        "a", href=re.compile(license_patterns, re.IGNORECASE)
-    )
-    has_license_text = re.search(license_patterns, html_content, re.IGNORECASE)
-
-    if has_license_link or has_license_text:
-        score += 0.2
-        matches.append("Open data license or terms reference detected")
-
-    # ----------------------------------------------------
-    # Rule 5: Generic Title & Heading Keywords
-    # ----------------------------------------------------
-    h1 = soup.find("h1")
-    title_tag = soup.find("title")
-
-    header_text = (h1.get_text() if h1 else "") + " " + (
-        title_tag.get_text() if title_tag else ""
-    )
-    keywords = (
-        "dataset",
-        "data set",
-        "open data",
-        "statistics",
-        "time series",
-        "data dictionary",
-        "raw data",
-        "microdata",
-    )
-
-    if any(kw in header_text.lower() for kw in keywords):
-        score += 0.2
-        matches.append("Dataset keywords present in page title/H1")
-
-    # Final score normalization
-    final_score = round(min(score, 1.0), 2)
-
-    return {
-        "url": url,
-        "score": final_score,
-        "is_dataset": final_score >= 0.40,
-        "resources": extracted_resources,
-        "matched_rules": matches,
-    }
+if __name__ == "__main__":
+    main()
