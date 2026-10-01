@@ -11,3 +11,4 @@ dependencies = [
 
 [project.scripts]
 sift = "prospector.sift:main"
+refine = "prospector.refine:main"

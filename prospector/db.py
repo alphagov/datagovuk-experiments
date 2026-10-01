@@ -50,6 +50,28 @@ def get_pages() -> list[tuple[str, int | None, str | None, str | None]]:
     ).fetchall()
 
 
+def get_high_scoring_pages(
+    threshold: float = 0.4,
+    limit: int | None = None,
+) -> list[tuple[str, str | None]]:
+    """Return (url, html) tuples for pages with dataset_score >= threshold.
+
+    If limit is set, returns at most that many rows.
+    Ordered by dataset_score descending (highest first).
+    """
+    conn = get_connection()
+    query = (
+        "SELECT url, html FROM pages "
+        "WHERE dataset_score >= ? AND html IS NOT NULL "
+        "ORDER BY dataset_score DESC"
+    )
+    params: list = [threshold]
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(query, params).fetchall()
+
+
 def update_dataset_score(url: str, score: float, matched_rules) -> None:
     """Update the dataset_score for a given URL."""
     conn = get_connection()
