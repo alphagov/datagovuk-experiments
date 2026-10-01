@@ -101,7 +101,7 @@ def process_dataset_with_llm(
 
     prompt = f"""
 Analyze the following webpage content.
-Synthesize a title, description.
+Synthesize a title and then a description - separate the two with '==='.
 
 Source URL: {page_url}
 
@@ -118,13 +118,11 @@ Page Text:
                 "role": "system",
                 "content": (
                     "You are an expert open data cataloguer. "
-                    "Analyze the input and return metadata adhering strictly to the required schema. "
-                    "Schema format as follows: " + json.dumps(CKANDatasetSchema.model_json_schema())
+                    "Analyze the input and respond only with the content requested; no pleasantries, pre-ambles or qualifiers."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
-        format="json",
         options={
             "temperature": 0.1,
             "num_ctx": 16000,
@@ -132,14 +130,12 @@ Page Text:
         },
     )
 
-    try:
-        result = CKANDatasetSchema.model_validate_json(response.message.content)
-    except ValidationError:
-        print("Validation error for LLM response JSON;")
-        print(response.message.content)
-        raise
-    dataset = result.model_dump()
-    dataset["resources"] = extracted_data["resources"]
+    raw_title, raw_description = response.message.content.split("===")
+    dataset = {
+        "title": raw_title.strip(),
+        "description": raw_description.strip(),
+        "resources": extracted_data["resources"],
+    }
     return dataset
 
 
